@@ -1,0 +1,15 @@
+cat <<EOT >> .gitignore
+# Environments
+.env
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Data and Models
+data/
+*.parquet
+*.pt
+
+# OS generated files
+.DS_Store
+EOT
