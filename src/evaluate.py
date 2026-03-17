@@ -1,13 +1,10 @@
 # src/evaluate.py
 import numpy as np
 from src.config import load_settings
-from src.search import QueryEncoder, execute_dynamic_search, parse_user_intent
+from src.search import parse_user_intent, retrieve_candidates
+from src.query_encoding import QueryFeatureProjector
+from src.reranker import SemanticReranker
 
-# =====================================================================
-# 1. THE TEST SUITE
-# Just write natural queries. The script will grade the results 
-# based on how well they match the extracted constraints.
-# =====================================================================
 TEST_QUERIES = [
     "easy chicken dinner under 45 mins",
     "vegan thanksgiving sides",
@@ -16,101 +13,195 @@ TEST_QUERIES = [
     "spicy pork tacos"
 ]
 
-def score_result_relevance(hit, intent, query_vector):
-    source = hit['_source']
-    
-    # Hard Constraints (No Credit if Violated)
-    if intent['max_minutes'] and source['minutes'] > intent['max_minutes']:
-        return 0.0
-    for diet in intent['dietary_tags']:
-        if diet not in source['tags_clean']:
+def score_result(result, intent) -> float:
+    """
+    Rule-based relevance scorer for evaluation.
+
+    Designed to compare:
+    - baseline Elasticsearch hits
+    - reranked RerankedResult objects
+
+    Score components:
+    1. Hard constraints: zero out if violated
+    2. Structured intent match bonuses
+    3. Leftover lexical intent bonus / penalty
+    """
+
+    # Support both ES hits and RerankedResult objects
+    source = result["_source"] if isinstance(result, dict) else result.source
+
+    score = 0.0
+
+    tags = source.get("tags_clean", [])
+    if tags is None:
+        tags = []
+    if isinstance(tags, str):
+        tags = [tags]
+
+    tags_norm = {str(tag).strip().lower() for tag in tags}
+    name_text = str(source.get("name", "")).lower()
+    ingredients_text = str(source.get("ingredients_clean", "")).lower()
+    minutes = source.get("minutes")
+
+    # -------------------------------------------------
+    # 1. Hard constraints
+    # -------------------------------------------------
+    max_minutes = intent.get("max_minutes")
+    if max_minutes is not None and minutes is not None:
+        try:
+            if float(minutes) > float(max_minutes):
+                return 0.0
+        except (TypeError, ValueError):
             return 0.0
 
-    # Semantic Proximity
-    res_vector = np.array(source.get('recipe_embedding', []))
-    q_vector = np.array(query_vector)
+    for diet in intent.get("dietary_tags", []):
+        if str(diet).strip().lower() not in tags_norm:
+            return 0.0
+
+    # -------------------------------------------------
+    # 2. Structured match bonuses
+    # -------------------------------------------------
+    structured_groups = [
+        ("cuisines", 1.0),
+        ("methods", 1.0),
+        ("occasions", 1.0),
+        ("courses", 1.0),
+    ]
+
+    for group_name, weight in structured_groups:
+        for value in intent.get(group_name, []):
+            if str(value).strip().lower() in tags_norm:
+                score += weight
+
+    # proteins often live in ingredients/title rather than tags
+    for protein in intent.get("proteins", []):
+        protein_norm = str(protein).strip().lower()
+        if protein_norm in name_text:
+            score += 1.0
+        elif protein_norm in ingredients_text:
+            score += 0.75
+
+    # Soft reward for target-time proximity
+    target_minutes = intent.get("target_minutes")
+    if target_minutes is not None and minutes is not None:
+        try:
+            distance = abs(float(minutes) - float(target_minutes))
+            if distance <= 5:
+                score += 0.75
+            elif distance <= 15:
+                score += 0.4
+        except (TypeError, ValueError):
+            pass
+
+    # -------------------------------------------------
+    # 3. Leftover lexical intent
+    # -------------------------------------------------
+    clean_text = str(intent.get("clean_text", "")).lower()
+    lexical_tokens = clean_text.split()
+
+    structured_tokens = set(
+        [str(x).strip().lower() for x in intent.get("proteins", [])]
+        + [str(x).strip().lower() for x in intent.get("dietary_tags", [])]
+        + [str(x).strip().lower() for x in intent.get("cuisines", [])]
+        + [str(x).strip().lower() for x in intent.get("methods", [])]
+        + [str(x).strip().lower() for x in intent.get("occasions", [])]
+        + [str(x).strip().lower() for x in intent.get("courses", [])]
+    )
+
+    leftover_tokens = [
+        t.strip()
+        for t in lexical_tokens
+        if t.strip() and t.strip() not in structured_tokens
+    ]
+
+    leftover_match = False
+    for token in leftover_tokens:
+        if token in name_text:
+            score += 0.75
+            leftover_match = True
+        elif token in ingredients_text:
+            score += 0.25
+            leftover_match = True
+
+    if leftover_tokens and not leftover_match:
+        score -= 0.75
+
+    return max(score, 0.0)
+
+def evaluate_query(query: str, s, projector, reranker) -> dict:
+    intent = parse_user_intent(query)
+    baseline_candidates, intent = retrieve_candidates(s, query)
+    projected_query = projector.project(query, intent)
+    reranked_results = reranker.rerank(projected_query, baseline_candidates)
+
+    baseline_top5 = baseline_candidates[:5]
+    reranked_top5 = reranked_results[:5]
+
+    baseline_scores = [score_result(hit, intent) for hit in baseline_top5]
+    reranked_scores = [score_result(result, intent) for result in reranked_top5]
+
+    baseline_mean = float(np.mean(baseline_scores)) if baseline_scores else 0.0
+    reranked_mean = float(np.mean(reranked_scores)) if reranked_scores else 0.0
+
+    return {
+        "query": query,
+        "intent": intent,
+        "baseline_results": baseline_top5,
+        "reranked_results": reranked_top5,
+        "baseline_scores": baseline_scores,
+        "reranked_scores": reranked_scores,
+        "baseline_mean": baseline_mean,
+        "reranked_mean": reranked_mean,
+        "delta": reranked_mean - baseline_mean,
+    }
     
-    # Calculate Cosine Similarity (0 to 1)
-    semantic_score = 0.0
-    if res_vector.size > 0:
-        norm_q = np.linalg.norm(q_vector)
-        norm_r = np.linalg.norm(res_vector)
-        if norm_q > 0 and norm_r > 0:
-            semantic_score = np.dot(q_vector, res_vector) / (norm_q * norm_r)
-
-    # Soft Constraints (Partial Credit Reduction)
-    score = semantic_score 
-    
-    # Apply penalties for missing 'should' intents
-    soft_penalty_groups = ["proteins", "courses", "cuisines", "methods", "occasions"]
-        
-    for group in soft_penalty_groups:
-        for tag in intent[group]:
-            # Proteins live in ingredients; everything else lives in tags
-            if group == "proteins":
-                match = any(tag in ing.lower() for ing in source.get('ingredients_clean', []))
-            else:
-                match = tag in source.get('tags_clean', [])
-                
-            if not match:
-                score *= 0.85
-
-    return score
-
 def evaluate_engine(s):
-    print("Initializing Neural-Aware Evaluation Pipeline...")
-    encoder = QueryEncoder(s)
-    
-    metrics = {"precision@5": [], "ndcg@5": []}
-    
-    print(f"Evaluating {len(TEST_QUERIES)} Test Queries...\n")
-    print("-" * 70)
-    
-    for query in TEST_QUERIES:
-        # 1. Capture the vector generated by the encoder during the search
-        # Update: We need search.py to return the vector or generate it here.
-        # Let's generate it here for the grader so it matches the search logic perfectly.
-        intent = parse_user_intent(query)
-        query_vector = encoder.encode(query) 
-        
-        # 2. Execute the search
-        results, _ = execute_dynamic_search(s, encoder, query, top_k=5)
-        
-        if not results:
-            print(f"Query: '{query}' -> 0 Results")
-            metrics["precision@5"].append(1.0)
-            metrics["ndcg@5"].append(1.0)
-            continue
-            
-        # 3. Grade each result using the captured query_vector
-        relevance_scores = [score_result_relevance(hit, intent, query_vector) for hit in results]
-        
-        # 4. Calculate Precision@5 
-        # (Since scores are now continuous 0.0-1.0, mean represents avg quality)
-        p_at_5 = np.mean(relevance_scores)
-        
-        # 5. Calculate nDCG@5
-        dcg = sum(rel / np.log2(idx + 2) for idx, rel in enumerate(relevance_scores))
-        
-        # Ideal DCG: Assuming the best possible results have a similarity of 1.0 
-        # and satisfy all soft constraints.
-        idcg = sum(1.0 / np.log2(idx + 2) for idx in range(len(results)))
-        ndcg_at_5 = dcg / idcg if idcg > 0 else 0.0
-        
-        metrics["precision@5"].append(p_at_5)
-        metrics["ndcg@5"].append(ndcg_at_5)
-        
-        print(f"Query: '{query}'")
-        print(f"  -> Precision@5: {p_at_5:.3f} | nDCG@5: {ndcg_at_5:.3f}")
-        print(f"  -> Hit Grades : {[round(s, 3) for s in relevance_scores]}") 
-        
-    print("\n" + "=" * 70)
-    print("FINAL SYSTEM PERFORMANCE REPORT")
-    print("=" * 70)
-    print(f"Mean Precision@5 : {np.mean(metrics['precision@5']):.4f}")
-    print(f"Mean nDCG@5      : {np.mean(metrics['ndcg@5']):.4f}")
-    print("=" * 70)
+    projector = QueryFeatureProjector(s)
+    reranker = SemanticReranker(s)
+
+    query_reports = [
+        evaluate_query(query, s, projector, reranker)
+        for query in TEST_QUERIES
+    ]
+
+    baseline_means = [r["baseline_mean"] for r in query_reports]
+    reranked_means = [r["reranked_mean"] for r in query_reports]
+
+    summary = {
+        "mean_baseline_score_at_5": float(np.mean(baseline_means)) if baseline_means else 0.0,
+        "mean_reranked_score_at_5": float(np.mean(reranked_means)) if reranked_means else 0.0,
+        "mean_delta": float(np.mean([r["delta"] for r in query_reports])) if query_reports else 0.0,
+        "query_reports": query_reports,
+    }
+
+    return summary
 
 if __name__ == "__main__":
     s = load_settings()
-    evaluate_engine(s)
+    summary = evaluate_engine(s)
+
+    for report in summary["query_reports"]:
+        print(f"\nQuery: {report['query']}")
+        print(f"Baseline mean@5: {report['baseline_mean']:.2f}")
+        print(f"Reranked mean@5: {report['reranked_mean']:.2f}")
+        print(f"Delta: {report['delta']:.2f}")
+
+        print("Baseline Top 5:")
+        for i, (hit, score) in enumerate(zip(report["baseline_results"], report["baseline_scores"]), start=1):
+            source = hit["_source"]
+            name = source.get("name", "").title()
+            minutes = source.get("minutes")
+            base_score = hit.get("_score", 0.0)
+            print(f"  {i}. [{base_score:.2f}] {name} ({minutes}m) - Eval: {score:.2f}")
+
+        print("Reranked Top 5:")
+        for i, (result, score) in enumerate(zip(report["reranked_results"], report["reranked_scores"]), start=1):
+            name = result.source.get("name", "").title()
+            minutes = result.source.get("minutes")
+            final_score = result.final_score
+            print(f"  {i}. [{final_score:.2f}] {name} ({minutes}m) - Eval: {score:.2f}")
+
+    print("\nOverall Summary")
+    print(f"Mean baseline score@5 : {summary['mean_baseline_score_at_5']:.2f}")
+    print(f"Mean reranked score@5 : {summary['mean_reranked_score_at_5']:.2f}")
+    print(f"Mean delta            : {summary['mean_delta']:.2f}")

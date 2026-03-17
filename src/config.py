@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from dotenv import load_dotenv
 import logging
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +51,7 @@ class Settings:
     # Processed data file paths
     processed_recipes_path: str
     processed_embedding_path: str
-    
+    column_mapping: dict[str, int]
     
 def validate_settings(s: Settings) -> None:
     require_raw = os.getenv("REQUIRE_RAW_INPUTS", "0").strip() == "1"
@@ -72,6 +73,15 @@ def load_settings() -> Settings:
     
     es_url = os.getenv("ES_CLIENT", "http://localhost:9200").strip().strip('"').strip("'")
     es_client = Elasticsearch(es_url) if es_url else None
+    if es_client is not None:
+        try:
+            es_client.info()
+        except Exception as e:
+            raise ConnectionError(
+                f"Could not connect to Elasticsearch at {es_url}. "
+                f"Check that Docker is running, the container is healthy, and the URL is correct."
+            ) from e
+            
     index_name = os.getenv("INDEX_NAME", "recipes_v1").strip().strip('"').strip("'").lower().replace(" ", "_")
     
     src_dir = resolve_path(os.getenv("SRC_DIR"), "./src")
@@ -80,8 +90,12 @@ def load_settings() -> Settings:
     processed_dir = resolve_path(os.getenv("PROCESSED_DIR"), "./data/processed")
 
     processed_recipes_path = resolve_path(os.getenv("PROCESSED_RECIPES_PATH"), "./data/processed/PROCESSED_search_recipes.parquet")
-    processed_embedding_path = resolve_path(os.getenv("PROCESSED_EMBEDDING_PATH"), "./data/processed/manifold_bundle_deep_all_features_huber_20260311_233206.pt")
-
+    processed_embedding_path = resolve_path(os.getenv("PROCESSED_EMBEDDING_PATH"), "./data/processed/final_residual_v2_embeddings.pt")
+    column_mapping_path = resolve_path(os.getenv("COLUMN_MAPPING"), "./data/processed/column_mapping.json")
+    
+    with open(column_mapping_path, 'r') as f:
+        column_mapping = json.load(f)
+    
     s = Settings(
         env=env,
         es_client=es_client,
@@ -91,7 +105,8 @@ def load_settings() -> Settings:
         raw_dir=raw_dir,
         processed_dir=processed_dir,
         processed_recipes_path=processed_recipes_path,
-        processed_embedding_path=processed_embedding_path
+        processed_embedding_path=processed_embedding_path,
+        column_mapping=column_mapping
     )
     validate_settings(s)
     return s

@@ -1,154 +1,199 @@
-import os
-import torch
-import torch.nn as nn
+# src/query_encoding.py
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List
+
 import numpy as np
-import pickle
-from typing import Tuple
 
-# --- REUSABLE BUILDING BLOCKS ---
 
-class FullyConnectedBlock(nn.Module):
+@dataclass
+class ProjectedQuery:
     """
-    Standard fully connected block with linear transformation, batch normalization, 
-    ReLU activation, and dropout. Exactly as defined in src/layers.py.
+    A structured representation of a user's query in the recipe feature space.
     """
-    def __init__(self, in_size: int, out_size: int, dropout: float = 0.2):
-        super().__init__()
-        self.linear = nn.Linear(in_size, out_size)
-        self.batchnorm = nn.BatchNorm1d(out_size)
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
-        self.init_weights()
-    
-    def init_weights(self):
-        nn.init.kaiming_normal_(self.linear.weight, nonlinearity='relu')
-        if self.linear.bias is not None:
-            nn.init.zeros_(self.linear.bias)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Check for batch size > 1 for BatchNorm, or use eval mode
-        x = self.linear(x)
-        if x.size(0) > 1 or not self.training:
-            x = self.batchnorm(x)
-        x = self.relu(x)
-        x = self.dropout(x)
-        return x
+    raw_query: str
+    lexical_query: str
+    clean_text: str
+    active_meta_features: List[str]
+    active_tag_features: List[str]
+    active_intensity_features: List[str]
+    meta_vector: np.ndarray
+    tag_vector: np.ndarray
+    target_minutes: int | None
+    max_minutes: int | None
+    proteins: List[str]
+    dietary_tags: List[str]
+    cuisines: List[str]
+    methods: List[str]
+    occasions: List[str]
+    courses: List[str]
 
-# --- INTERNAL ENCODER ARCHITECTURE ---
 
-class DeepEncoderInternal(nn.Module):
+class QueryFeatureProjector:
     """
-    A structural mirror of the 'Deep' path in RecipeNet to facilitate 
-    direct weight loading from the best_model_deep_all_features.pth.
+    Deterministic query-to-feature projector 
     """
-    def __init__(self, meta_in: int, tag_in: int, hidden_dim: int):
-        super().__init__()
-        # 1. Metadata Encoder (Legacy version)
-        self.legacy_meta_encoder = nn.Sequential(
-            FullyConnectedBlock(meta_in, hidden_dim),
-            FullyConnectedBlock(hidden_dim, hidden_dim)
-        )
-        
-        # 2. Tag Encoder
-        self.tag_encoder = nn.Sequential(
-            FullyConnectedBlock(tag_in, hidden_dim),
-            FullyConnectedBlock(hidden_dim, hidden_dim)
-        )
-        
-        # 3. The Deep Head (The 10-layer winner)
-        fusion_dim = hidden_dim * 2
-        layers = []
-        layers.append(FullyConnectedBlock(fusion_dim, fusion_dim))
-        for _ in range(8):
-            layers.append(FullyConnectedBlock(fusion_dim, fusion_dim))
-        layers.append(FullyConnectedBlock(fusion_dim, hidden_dim))
-        
-        self.head = nn.Sequential(*layers)
 
-    def forward(self, meta_x: torch.Tensor, tag_x: torch.Tensor) -> torch.Tensor:
-        meta_out = self.legacy_meta_encoder(meta_x)
-        tag_out = self.tag_encoder(tag_x)
-        fused = torch.cat((meta_out, tag_out), dim=1)
-        return self.head(fused)
-
-# --- PUBLIC SEARCH API ---
-
-class QueryEncoder:
-    def __init__(self, s):
+    def __init__(self, s: Any):
         self.s = s
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # 1. Load Vocabulary
-        vocab_path = "models/vocab_deep_all_features.pkl"
-        try:
-            with open(vocab_path, "rb") as f:
-                self.vocab = pickle.load(f)
-        except FileNotFoundError:
-            print(f"Error: {vocab_path} not found.")
-            self.vocab = {}
+        self.col_map: Dict[str, int] = s.column_mapping
 
-        # 2. Initialize Model
-        self.model = DeepEncoderInternal(
-            meta_in=s.meta_in_dim, 
-            tag_in=s.tag_in_dim, 
-            hidden_dim=128
-        ).to(self.device)
+        self.meta_features = [k for k in self.col_map.keys() if not k.startswith("pred_")]
+        self.tag_features = [k for k in self.col_map.keys() if k.startswith("pred_")]
 
-        # 3. Load Weights
-        model_path = "models/best_model_deep_all_features.pth"
-        if os.path.exists(model_path):
-            # Load with strict=False to ignore the regressor layer weights
-            self.model.load_state_dict(torch.load(model_path, map_location=self.device), strict=False)
-            print(f"Deep Search Model loaded: {model_path}")
-        
-        self.model.eval()
+        self.meta_index = {name: i for i, name in enumerate(self.meta_features)}
+        self.tag_index = {name: i for i, name in enumerate(self.tag_features)}
 
-    def vectorize_query(self, raw_query: str) -> Tuple[torch.Tensor, torch.Tensor]:
+    @staticmethod
+    def _normalize_token(text: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        return re.findall(r"[a-zA-Z0-9\-]+", text.lower())
+
+    def _activate_feature(
+        self,
+        feature_name: str,
+        active_features: List[str],
+        vector: np.ndarray,
+        feature_index: Dict[str, int],
+    ) -> None:
+        idx = feature_index.get(feature_name)
+        if idx is None:
+            return
+        vector[idx] = 1.0
+        if feature_name not in active_features:
+            active_features.append(feature_name)
+
+    def _project_tokens_to_meta(
+        self,
+        tokens: List[str],
+        active_meta_features: List[str],
+        meta_vector: np.ndarray,
+    ) -> None:
         """
-        Transforms raw text into the dual-tensors expected by the model.
-        Zeros out the tag stream as it represents review feedback.
+        Activate simple categorical/ingredient OHE features from lexical tokens.
         """
-        # 1. Initialize empty tensors on the correct device
-        meta_x = torch.zeros((1, self.s.meta_in_dim)).to(self.device)
-        tag_x = torch.zeros((1, self.s.tag_in_dim)).to(self.device)
-        
-        # 2. Extract Keywords for Categorical Features
-        # This replicates encode_multi_label_features logic from preprocessing.py
-        tokens = raw_query.lower().split()
-        
-        # 3. Map tokens to the 'cat_' and 'ing_' feature indices
-        # Your meta_x vector expects: [Numerical Features] + [One-Hot Categorical Features]
-        # Based on your preprocessing, these are prefixed with 'cat_' and 'ing_'
         for token in tokens:
-            # Clean token to match format used in encode_multi_label_features
-            clean_token = token.replace('-', '_').replace(' ', '_')
-            
-            # Check if this token is in your top_n vocabulary (stored in self.vocab)
-            # Tag Feature Mapping
-            cat_feature_name = f"cat_{clean_token}"
-            if cat_feature_name in self.vocab:
-                idx = self.vocab[cat_feature_name]
-                meta_x[0, idx] = 1.0
-                
-            # Ingredient Feature Mapping
-            ing_feature_name = f"ing_{clean_token}"
-            if ing_feature_name in self.vocab:
-                idx = self.vocab[ing_feature_name]
-                meta_x[0, idx] = 1.0
+            normalized = self._normalize_token(token)
 
-        return meta_x, tag_x
+            for prefix in ("cat_", "ing_"):
+                feature_name = f"{prefix}{normalized}"
+                self._activate_feature(
+                    feature_name=feature_name,
+                    active_features=active_meta_features,
+                    vector=meta_vector,
+                    feature_index=self.meta_index,
+                )
 
-    def encode(self, raw_query: str) -> list[float]:
+    def _project_structured_tags(
+        self,
+        intent: Dict[str, Any],
+        active_meta_features: List[str],
+        active_tag_features: List[str],
+        active_intensity_features: List[str],
+        meta_vector: np.ndarray,
+        tag_vector: np.ndarray,
+    ) -> None:
         """
-        Main entry point for generating a search vector.
+        Project structured intent into known feature-space activations.
         """
-        meta_x, tag_x = self.vectorize_query(raw_query)
-        
-        with torch.no_grad():
-            embedding = self.model(meta_x, tag_x)
-            
-            # L2 Normalization ensures Cosine Similarity in Elasticsearch
-            norm = torch.norm(embedding, p=2, dim=1, keepdim=True)
-            normalized_embedding = embedding / (norm + 1e-8)
-            
-        return normalized_embedding.squeeze().cpu().numpy().tolist()
+        structured_groups = {
+            "dietary_tags": intent.get("dietary_tags", []),
+            "courses": intent.get("courses", []),
+            "cuisines": intent.get("cuisines", []),
+            "methods": intent.get("methods", []),
+            "occasions": intent.get("occasions", []),
+            "proteins": intent.get("proteins", []),
+        }
+
+        for values in structured_groups.values():
+            for value in values:
+                normalized = self._normalize_token(value)
+
+                # Try metadata-side categorical activation first
+                cat_feature = f"cat_{normalized}"
+                self._activate_feature(
+                    feature_name=cat_feature,
+                    active_features=active_meta_features,
+                    vector=meta_vector,
+                    feature_index=self.meta_index,
+                )
+
+                # Try ingredient-side activation too
+                ing_feature = f"ing_{normalized}"
+                self._activate_feature(
+                    feature_name=ing_feature,
+                    active_features=active_meta_features,
+                    vector=meta_vector,
+                    feature_index=self.meta_index,
+                )
+
+                # Try qualitative tag activation
+                pred_feature = f"pred_{normalized}"
+                self._activate_feature(
+                    feature_name=pred_feature,
+                    active_features=active_tag_features,
+                    vector=tag_vector,
+                    feature_index=self.tag_index,
+                )
+
+                # Track intensity feature names for downstream rerank logic.
+                intensity_feature = f"intensity_{normalized}"
+                if intensity_feature in self.col_map and intensity_feature not in active_intensity_features:
+                    active_intensity_features.append(intensity_feature)
+
+    def project(self, raw_query: str, intent: Dict[str, Any]) -> ProjectedQuery:
+        """
+        Returns a deterministic structured representation of the query, aligned to the schema contract in column_mapping.json.
+        """
+        lexical_query = intent.get("lexical_query", raw_query).strip()
+        clean_text = intent.get("clean_text", raw_query).strip()
+        tokens = self._tokenize(lexical_query)
+
+        meta_vector = np.zeros(len(self.meta_features), dtype=np.float32)
+        tag_vector = np.zeros(len(self.tag_features), dtype=np.float32)
+
+        active_meta_features: List[str] = []
+        active_tag_features: List[str] = []
+        active_intensity_features: List[str] = []
+
+        # 1) lexical token projection
+        self._project_tokens_to_meta(
+            tokens=tokens,
+            active_meta_features=active_meta_features,
+            meta_vector=meta_vector,
+        )
+
+        # 2) structured intent projection
+        self._project_structured_tags(
+            intent=intent,
+            active_meta_features=active_meta_features,
+            active_tag_features=active_tag_features,
+            active_intensity_features=active_intensity_features,
+            meta_vector=meta_vector,
+            tag_vector=tag_vector,
+        )
+
+        return ProjectedQuery(
+            raw_query=raw_query,
+            lexical_query=lexical_query,
+            clean_text=clean_text,
+            active_meta_features=sorted(active_meta_features),
+            active_tag_features=sorted(active_tag_features),
+            active_intensity_features=sorted(active_intensity_features),
+            meta_vector=meta_vector,
+            tag_vector=tag_vector,
+            target_minutes=intent.get("target_minutes"),
+            max_minutes=intent.get("max_minutes"),
+            proteins=list(intent.get("proteins", [])),
+            dietary_tags=list(intent.get("dietary_tags", [])),
+            cuisines=list(intent.get("cuisines", [])),
+            methods=list(intent.get("methods", [])),
+            occasions=list(intent.get("occasions", [])),
+            courses=list(intent.get("courses", [])),
+        )

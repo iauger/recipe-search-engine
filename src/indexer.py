@@ -10,8 +10,8 @@ if not hasattr(np, 'float_'):
     np.float_ = np.float64 # type: ignore
 
 def get_tags(df: pd.DataFrame) -> list[str]:
-    """Extracts the 17 qualitative tags from the dataframe columns."""
-    return [col for col in df.columns if col.startswith("pred_")]
+    """Extract base tag names from pred_* columns."""
+    return [col.removeprefix("pred_") for col in df.columns if col.startswith("pred_")]
 
 def create_index(s):
     """Deletes the old index if it exists and creates a new one with strict mappings."""
@@ -41,12 +41,6 @@ def create_index(s):
         "minutes": {"type": "float"},
         "n_steps": {"type": "integer"},
         "n_ingredients": {"type": "integer"},
-        "recipe_embedding": {
-            "type": "dense_vector",
-            "dims": 128,
-            "index": True,
-            "similarity": "cosine"
-        },
         "bayesian_rating": {"type": "float"},
         "review_count": {"type": "integer"}
     }
@@ -64,19 +58,11 @@ def create_index(s):
 
 def generate_documents(df, bundle, s):
     """Yields documents in the format required by Elasticsearch bulk API."""
-    embeddings = bundle['embeddings'].numpy()
-    bundle_ids = bundle['recipe_ids']
-    
-    embed_dict = {str(r_id): emb.tolist() for r_id, emb in zip(bundle_ids, embeddings)}
     
     for idx, row in df.iterrows():
         r_id = str(row['recipe_id'])
-        
-        if r_id not in embed_dict:
-            continue
             
         doc = row.to_dict()
-        doc['recipe_embedding'] = embed_dict[r_id]
                 
         yield {
             "_index": s.index_name,
