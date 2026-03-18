@@ -463,10 +463,11 @@ class SemanticReranker:
         self,
         projected_query: Any,
         candidates: List[Dict[str, Any]],
+        mode_weights: Dict[str, Any] | None = None,
     ) -> List[RerankedResult]:
         """
         Rerank a list of Stage 1 Elasticsearch candidates.
-
+ 
         Pipeline per candidate:
           1. score_alignment   – rule-based structured intent check
           2. encode_query      – project query into 128-D latent space (once)
@@ -474,35 +475,42 @@ class SemanticReranker:
           4. get_quality_score – scalar predicted rating
           5. combine_scores    – weighted sum → final_score
           6. sort descending by final_score
-
+ 
         Parameters
         ----------
         projected_query : ProjectedQuery
             Output of QueryFeatureProjector.project().
         candidates : list of ES hit dicts
             Raw hits from retrieve_candidates().
-
+        mode_weights : dict | None
+            When provided by the engine (e.g. for LEXICAL, SEMANTIC, QUALITY
+            modes), bypasses get_weight_profile() entirely and uses the
+            supplied fixed weights instead.  When None, stratified weights
+            are resolved from the query's intent richness as normal — this
+            is the default behaviour for HYBRID and ABLATION_NO_SEM.
+ 
         Returns
         -------
         List[RerankedResult] sorted by final_score descending.
         """
-        # Resolve weight profile once for this query
-        weights = self.get_weight_profile(projected_query)
-
+        # Use caller-supplied fixed weights (engine modes) or resolve
+        # stratified weights from query intent richness (hybrid/ablation).
+        weights = mode_weights if mode_weights is not None else self.get_weight_profile(projected_query)
+ 
         # Encode the query once – shared across all candidates
         query_embedding = self.encode_query(projected_query)
-
+ 
         reranked: List[RerankedResult] = []
-
+ 
         for hit in candidates:
             recipe_id  = str(hit["_id"])
             source     = hit["_source"]
             base_score = float(hit.get("_score", 0.0))
-
+ 
             alignment_score = self.score_alignment(projected_query, source)
             semantic_sim    = self.compute_semantic_similarity(query_embedding, recipe_id)
             quality_score   = self.get_quality_score(recipe_id)
-
+ 
             final_score = self.combine_scores(
                 base_score=base_score,
                 alignment_score=alignment_score,
@@ -510,7 +518,7 @@ class SemanticReranker:
                 quality_score=quality_score,
                 weights=weights,
             )
-
+ 
             reranked.append(
                 RerankedResult(
                     recipe_id=recipe_id,
@@ -522,7 +530,7 @@ class SemanticReranker:
                     source=source,
                 )
             )
-
+ 
         reranked.sort(key=lambda x: x.final_score, reverse=True)
         return reranked
 
