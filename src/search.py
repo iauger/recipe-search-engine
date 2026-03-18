@@ -18,6 +18,7 @@ class BoostValue(float, Enum):
     MULTI_MATCH = 0.5
     PROTEIN_MATCH = 2.0
     TAG_MATCH = 1.5
+    TASTE_MATCH = 0.5
 
 
 class RetrievalConfig(int, Enum):
@@ -38,6 +39,8 @@ class IntentKey(str, Enum):
     CUISINES = "cuisines"
     METHODS = "methods"
     OCCASIONS = "occasions"
+    TASTE = "taste"
+    DISH_TYPE = "dish_type"
 
 
 PROTEIN_KEYWORDS = [
@@ -92,7 +95,7 @@ TAG_MAPPINGS: Dict[str, Dict[str, str]] = {
         r"\bappetizer[s]?\b": "appetizers",
         r"\bsnack[s]?\b": "snacks",
         r"\bdessert[s]?\b": "desserts",
-        r"\bside[-\s]?dish(?:es)?\b": "side-dishes",
+        r"\b(side[-\s]?dish(?:es)?|side(?:s)?|accompaniment(?:s)?)\b": "side-dishes",
         r"\bsoup[s]?\b": "soups-stews",
         r"\bsalad[s]?\b": "salads",
         r"\bbeverage[s]?\b": "beverages",
@@ -132,6 +135,31 @@ TAG_MAPPINGS: Dict[str, Dict[str, str]] = {
         r"\bkid[-\s]?friendly\b": "kid-friendly",
         r"\btoddler[-\s]?friendly\b": "toddler-friendly",
     },
+    IntentKey.TASTE.value: {
+    r"\bsweet\b": "sweet",
+    r"\bspicy\b": "spicy",
+    r"\bsavory\b": "savory",
+    r"\bsalty\b": "salty",
+    r"\bsour\b": "sour",
+    r"\btangy\b": "tangy",
+    r"\bsmoky\b": "smoky",
+    r"\bcreamy\b": "creamy",
+    r"\bgarlicky\b": "garlicky",
+    r"\bcheesy\b": "cheesy",
+    },
+    IntentKey.DISH_TYPE.value: {
+    r"\btaco[s]?\b": "tacos",
+    r"\bburrito[s]?\b": "burritos",
+    r"\bwrap[s]?\b": "wraps",
+    r"\bsandwich(?:es)?\b": "sandwiches",
+    r"\bburger[s]?\b": "burgers",
+    r"\bpizza\b": "pizza",
+    r"\bpasta\b": "pasta",
+    r"\bskillet\b": "skillet",
+    r"\bsoup[s]?\b": "soups",
+    r"\bstew[s]?\b": "stews",
+    r"\bsalad[s]?\b": "salads",
+}
 }
 
 
@@ -148,6 +176,8 @@ def initialize_intent(raw_query: str) -> Dict[str, Any]:
         IntentKey.CUISINES.value: [],
         IntentKey.METHODS.value: [],
         IntentKey.OCCASIONS.value: [],
+        IntentKey.TASTE.value: [],
+        IntentKey.DISH_TYPE.value: [],
     }
 
 
@@ -270,6 +300,7 @@ def apply_soft_boosts(base_query: Dict[str, Any], intent: Dict[str, Any]) -> Non
         + intent[IntentKey.CUISINES.value]
         + intent[IntentKey.METHODS.value]
         + intent[IntentKey.OCCASIONS.value]
+        + intent[IntentKey.DISH_TYPE.value]
     )
 
     for tag in soft_tags:
@@ -279,6 +310,18 @@ def apply_soft_boosts(base_query: Dict[str, Any], intent: Dict[str, Any]) -> Non
                     SearchField.TAGS.value: {
                         "value": tag,
                         "boost": float(BoostValue.TAG_MATCH.value),
+                    }
+                }
+            }
+        )
+
+    for taste in intent[IntentKey.TASTE.value]:
+        base_query["bool"]["should"].append(
+            {
+                "term": {
+                    SearchField.TAGS.value: {
+                        "value": taste,
+                        "boost": float(BoostValue.TASTE_MATCH.value),
                     }
                 }
             }

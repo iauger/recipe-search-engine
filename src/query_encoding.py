@@ -30,6 +30,8 @@ class ProjectedQuery:
     methods: List[str]
     occasions: List[str]
     courses: List[str]
+    taste: List[str]
+    dish_type: List[str]
 
 
 class QueryFeatureProjector:
@@ -109,6 +111,8 @@ class QueryFeatureProjector:
             "methods": intent.get("methods", []),
             "occasions": intent.get("occasions", []),
             "proteins": intent.get("proteins", []),
+            "taste": intent.get("taste", []),
+            "dish_type": intent.get("dish_type", []),
         }
 
         for values in structured_groups.values():
@@ -196,4 +200,6 @@ class QueryFeatureProjector:
             methods=list(intent.get("methods", [])),
             occasions=list(intent.get("occasions", [])),
             courses=list(intent.get("courses", [])),
+            taste=list(intent.get("taste", [])),
+            dish_type=list(intent.get("dish_type", [])),
         )

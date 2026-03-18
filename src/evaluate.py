@@ -166,8 +166,10 @@ def evaluate_engine(s):
 
     baseline_means = [r["baseline_mean"] for r in query_reports]
     reranked_means = [r["reranked_mean"] for r in query_reports]
+    intents = [r["intent"] for r in query_reports]
 
     summary = {
+        "intent": intents,
         "mean_baseline_score_at_5": float(np.mean(baseline_means)) if baseline_means else 0.0,
         "mean_reranked_score_at_5": float(np.mean(reranked_means)) if reranked_means else 0.0,
         "mean_delta": float(np.mean([r["delta"] for r in query_reports])) if query_reports else 0.0,
@@ -182,6 +184,7 @@ if __name__ == "__main__":
 
     for report in summary["query_reports"]:
         print(f"\nQuery: {report['query']}")
+        print(f"Intent: {report['intent']}")
         print(f"Baseline mean@5: {report['baseline_mean']:.2f}")
         print(f"Reranked mean@5: {report['reranked_mean']:.2f}")
         print(f"Delta: {report['delta']:.2f}")

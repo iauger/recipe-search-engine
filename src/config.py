@@ -51,13 +51,14 @@ class Settings:
     # Processed data file paths
     processed_recipes_path: str
     processed_embedding_path: str
+    model_weights_path: str
     column_mapping: dict[str, int]
     
 def validate_settings(s: Settings) -> None:
     require_raw = os.getenv("REQUIRE_RAW_INPUTS", "0").strip() == "1"
 
     if s.env == "local" and require_raw:
-        for p in [s.processed_recipes_path, s.processed_embedding_path]:
+        for p in [s.processed_recipes_path, s.processed_embedding_path, s.model_weights_path]:
             if not Path(p).exists():
                 raise FileNotFoundError(f"Missing required file: {p}")
 
@@ -91,6 +92,7 @@ def load_settings() -> Settings:
 
     processed_recipes_path = resolve_path(os.getenv("PROCESSED_RECIPES_PATH"), "./data/processed/PROCESSED_search_recipes.parquet")
     processed_embedding_path = resolve_path(os.getenv("PROCESSED_EMBEDDING_PATH"), "./data/processed/final_residual_v2_embeddings.pt")
+    model_weights_path = resolve_path(os.getenv("MODEL_WEIGHTS_PATH"), "./data/processed/best_model_residual_v2_all_features_mse.pth")
     column_mapping_path = resolve_path(os.getenv("COLUMN_MAPPING"), "./data/processed/column_mapping.json")
     
     with open(column_mapping_path, 'r') as f:
@@ -106,6 +108,7 @@ def load_settings() -> Settings:
         processed_dir=processed_dir,
         processed_recipes_path=processed_recipes_path,
         processed_embedding_path=processed_embedding_path,
+        model_weights_path=model_weights_path,
         column_mapping=column_mapping
     )
     validate_settings(s)
