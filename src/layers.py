@@ -4,6 +4,8 @@ from typing import cast
 
 """
 Layers module for defining reusable building blocks of the neural network architecture, such as fully connected blocks and residual blocks.
+This module is copied from the embedding phase of the project, so contains some layers that are not used in this phase
+I'm leaving them alone for now, but in a future refactor to combine all phases into a single codebase, I would consider removing unused layers and consolidating the code to avoid duplication across phases.
 """
 
 # Reusable fully connected block with normalization, activation, and dropout

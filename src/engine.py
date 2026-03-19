@@ -2,37 +2,6 @@
 
 """
 Search engine orchestration layer.
-
-Exposes a single SearchEngine.run() interface that dispatches across five
-search modes, analogous to the HeadType / AblationType / LossFunc matrix
-in Phase 2.  The engine owns mode selection and weight dispatch; the
-underlying retrieval, encoding, and reranking modules are unchanged.
-
-Search Modes
-------------
-LEXICAL
-    Elasticsearch BM25 only.  No reranking signal applied — raw Stage 1
-    ranking is returned as-is.  Serves as the baseline for all comparisons.
-
-SEMANTIC
-    Embedding cosine similarity + quality score only.  Alignment is zeroed
-    out, so structured rule matching plays no role.  Isolates the pure
-    latent-space signal from the Phase 2 RecipeNet embeddings.
-
-QUALITY
-    Quality score (predicted Bayesian rating) only.  No lexical, alignment,
-    or semantic signal.  Surfaces what the Phase 2 model considers the best
-    recipes regardless of query relevance.  Useful as a sanity-check baseline
-    and exposes the Phase 2 rating-skew limitation in isolation.
-
-ABLATION_NO_SEM
-    Full hybrid pipeline minus the embedding similarity term.  Uses
-    stratified weights based on query intent richness.  Direct comparison
-    with HYBRID isolates the marginal contribution of the embedding layer.
-
-HYBRID
-    Full pipeline: lexical + alignment + semantic + quality, with stratified
-    weights determined by query intent richness.  The primary system.
 """
 
 from __future__ import annotations
@@ -53,21 +22,41 @@ from src.reranker import RerankedResult, SemanticReranker
 from src.search import parse_user_intent, retrieve_candidates
 
 
-# ---------------------------------------------------------------------------
 # Search mode definitions
-# ---------------------------------------------------------------------------
-
 class SearchMode(Enum):
     LEXICAL         = "lexical"
     SEMANTIC        = "semantic"
     QUALITY         = "quality"
     ABLATION_NO_SEM = "ablation_no_sem"
     HYBRID          = "hybrid"
+    
+"""Search Modes
+------------
+LEXICAL
+    Elasticsearch BM25 only.  No reranking signal applied — raw Stage 1
+    ranking is returned as-is.  Serves as the baseline for all comparisons.
 
+SEMANTIC
+    Embedding cosine similarity + quality score only.  Alignment is zeroed
+    out, so structured rule matching plays no role.  Isolates the pure
+    latent-space signal from the Phase 2 RecipeNet embeddings.
+
+QUALITY
+    Quality score (predicted Bayesian rating) only.  No lexical, alignment,
+    or semantic signal.  Surfaces what the Phase 2 model considers the best
+    recipes regardless of query relevance.  
+    
+ABLATION_NO_SEM
+    Full hybrid pipeline minus the embedding similarity term.  Uses
+    stratified weights based on query intent richness.  Direct comparison
+    with HYBRID isolates the contribution of the embedding layer.
+
+HYBRID
+    Full pipeline: lexical + alignment + semantic + quality, with stratified
+    weights determined by query intent richness.
+"""
 
 # Fixed weight profiles for non-stratified modes.
-# ABLATION_NO_SEM and HYBRID are intentionally absent — they delegate to
-# SemanticReranker.get_weight_profile() for stratified intent-based weights.
 _FIXED_WEIGHTS: Dict[SearchMode, Dict[str, Any]] = {
     SearchMode.LEXICAL: {
         "tier": "lexical",
@@ -96,21 +85,14 @@ _FIXED_WEIGHTS: Dict[SearchMode, Dict[str, Any]] = {
 _STRATIFIED_MODES = {SearchMode.HYBRID, SearchMode.ABLATION_NO_SEM}
 
 # For ABLATION_NO_SEM the stratified weights are used but semantic is zeroed.
-# This is applied as a post-processing step on the resolved stratified profile.
 _ABLATION_SEMANTIC_ZERO = {SearchMode.ABLATION_NO_SEM}
 
-
-# ---------------------------------------------------------------------------
-# Result container
-# ---------------------------------------------------------------------------
+# Results
 
 @dataclass
 class SearchResult:
     """
     Complete result bundle for a single query/mode execution.
-
-    Carries enough information for evaluation, UI rendering, and the latent
-    space visualisation without callers needing to reach into sub-modules.
     """
     query: str
     mode: SearchMode
@@ -120,27 +102,11 @@ class SearchResult:
     candidates: List[Dict[str, Any]]    # raw Stage 1 ES hits
     results: List[RerankedResult]       # reranked / ordered results
     query_embedding: Optional[Any] = field(default=None, repr=False)
-    # query_embedding is populated when the caller requests it (e.g. for
-    # latent space visualisation).  None by default to avoid the forward
-    # pass overhead in evaluation loops that don't need it.
 
-
-# ---------------------------------------------------------------------------
 # Engine
-# ---------------------------------------------------------------------------
-
 class SearchEngine:
     """
     Unified search interface over all five search modes.
-
-    Initialised once and reused across queries — the underlying reranker
-    and projector are expensive to load and should not be re-instantiated
-    per query.
-
-    Parameters
-    ----------
-    s : Settings
-        Loaded settings object from config.load_settings().
     """
 
     def __init__(self, s: Any):
@@ -148,10 +114,7 @@ class SearchEngine:
         self.projector = QueryFeatureProjector(s)
         self.reranker  = SemanticReranker(s)
 
-    # ------------------------------------------------------------------
     # Public interface
-    # ------------------------------------------------------------------
-
     def run(
         self,
         query: str,
@@ -223,16 +186,9 @@ class SearchEngine:
         """
         Run a query through all five modes in a single call.
 
-        Retrieves Stage 1 candidates once and shares them across all modes
-        to ensure a fair comparison — every mode ranks the same candidate set.
-
-        Returns
-        -------
-        dict mapping SearchMode → SearchResult
+        Retrieves Stage 1 candidates once and shares them across all modes to ensure a fair comparison.
         """
-        # Retrieve once, share across all modes.
-        # candidates are copied per-mode to prevent any in-place mutation
-        # of hit dicts from leaking across mode iterations.
+        # Retrieve once, share across all modes. Candidates are copied per-mode to prevent any in-place mutation
         candidates, intent = retrieve_candidates(self.s, query, top_k=top_k)
         projected_query = self.projector.project(query, intent)
 
@@ -263,10 +219,6 @@ class SearchEngine:
 
         return results
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
     def _resolve_weights(
         self,
         projected_query: Any,
@@ -274,10 +226,6 @@ class SearchEngine:
     ) -> tuple[Dict[str, Any], str]:
         """
         Return (weights_dict, tier_label) for the given mode.
-
-        Fixed modes return their constant profile from _FIXED_WEIGHTS.
-        Stratified modes delegate to get_weight_profile(), then
-        ABLATION_NO_SEM zeroes the semantic term on the resolved profile.
         """
         if mode in _STRATIFIED_MODES:
             weights = dict(self.reranker.get_weight_profile(projected_query))
@@ -298,10 +246,6 @@ class SearchEngine:
     ) -> List[RerankedResult]:
         """
         Wrap raw ES hits as RerankedResult objects.
-
-        For LEXICAL mode the ES score is the final score; all other
-        components are zero.  This gives a uniform result interface
-        across all modes so callers never need to branch on mode type.
         """
         return [
             RerankedResult(
@@ -316,11 +260,7 @@ class SearchEngine:
             for hit in candidates
         ]
 
-
-# ---------------------------------------------------------------------------
-# Smoke test — run all 5 modes across all 3 intent tiers
-# ---------------------------------------------------------------------------
-
+# Testing and demonstration with test queries
 if __name__ == "__main__":
     s = load_settings()
     engine = SearchEngine(s)

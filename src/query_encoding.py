@@ -8,6 +8,13 @@ from typing import Any, Dict, List
 
 import numpy as np
 
+"""
+This module defines the logic for projecting user queries into the feature space used by the recipe recommendation model.
+The `QueryFeatureProjector` class takes raw user queries and their associated structured intent, 
+and produces a `ProjectedQuery` object that contains activated features aligned with the model's expectations.
+Leverages a simple version of Named Entity Recognition (NER) to identify and activate relevant features based on both lexical tokens and structured intent fields,
+and projects them into sparse vectors that can be directly consumed by the model for retrieval and reranking.
+"""
 
 @dataclass
 class ProjectedQuery:
@@ -166,14 +173,14 @@ class QueryFeatureProjector:
         active_tag_features: List[str] = []
         active_intensity_features: List[str] = []
 
-        # 1) lexical token projection
+        # lexical token projection
         self._project_tokens_to_meta(
             tokens=tokens,
             active_meta_features=active_meta_features,
             meta_vector=meta_vector,
         )
 
-        # 2) structured intent projection
+        # structured intent projection
         self._project_structured_tags(
             intent=intent,
             active_meta_features=active_meta_features,

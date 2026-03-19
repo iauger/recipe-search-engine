@@ -5,6 +5,18 @@ from typing import Any, Dict, List, Tuple
 
 from src.config import load_settings
 
+"""
+Search module for recipe retrieval based on user queries.
+- Parses user queries to extract intent, including time constraints, protein preferences, dietary tags, and other attributes.
+- Builds Elasticsearch queries with appropriate filters and boosts based on the parsed intent.
+
+Note: I lean pretty heavily on the inbuilt tagging of the dataset for dietary tags, courses, cuisines, methods, and occasions. This is because:
+1) It allows for more precise filtering and boosting based on user intent.
+2) The dataset tags are fairly comprehensive and often include relevant information that may not be explicitly mentioned in the query text.
+
+This might not be a generalizale approach to lexical retrieval in other domains, but for recipe search it seems to work well and allows us to leverage the structure of the dataset effectively.
+"""
+
 
 class SearchField(str, Enum):
     NAME = "name^2"
@@ -59,6 +71,9 @@ PROTEIN_KEYWORDS = [
     "eggs",
 ]
 
+# Mapping of regex patterns to standardized tags for each category.
+# Tags are pre-applied to recipes in the dataset. This mapping covers common
+# user phrases; unmapped phrases are captured in the lexical query for matching.
 TAG_MAPPINGS: Dict[str, Dict[str, str]] = {
     IntentKey.DIETARY_TAGS.value: {
         r"\bvegan\b": "vegan",
@@ -136,30 +151,30 @@ TAG_MAPPINGS: Dict[str, Dict[str, str]] = {
         r"\btoddler[-\s]?friendly\b": "toddler-friendly",
     },
     IntentKey.TASTE.value: {
-    r"\bsweet\b": "sweet",
-    r"\bspicy\b": "spicy",
-    r"\bsavory\b": "savory",
-    r"\bsalty\b": "salty",
-    r"\bsour\b": "sour",
-    r"\btangy\b": "tangy",
-    r"\bsmoky\b": "smoky",
-    r"\bcreamy\b": "creamy",
-    r"\bgarlicky\b": "garlicky",
-    r"\bcheesy\b": "cheesy",
+        r"\bsweet\b": "sweet",
+        r"\bspicy\b": "spicy",
+        r"\bsavory\b": "savory",
+        r"\bsalty\b": "salty",
+        r"\bsour\b": "sour",
+        r"\btangy\b": "tangy",
+        r"\bsmoky\b": "smoky",
+        r"\bcreamy\b": "creamy",
+        r"\bgarlicky\b": "garlicky",
+        r"\bcheesy\b": "cheesy",
     },
     IntentKey.DISH_TYPE.value: {
-    r"\btaco[s]?\b": "tacos",
-    r"\bburrito[s]?\b": "burritos",
-    r"\bwrap[s]?\b": "wraps",
-    r"\bsandwich(?:es)?\b": "sandwiches",
-    r"\bburger[s]?\b": "burgers",
-    r"\bpizza\b": "pizza",
-    r"\bpasta\b": "pasta",
-    r"\bskillet\b": "skillet",
-    r"\bsoup[s]?\b": "soups",
-    r"\bstew[s]?\b": "stews",
-    r"\bsalad[s]?\b": "salads",
-}
+        r"\btaco[s]?\b": "tacos",
+        r"\bburrito[s]?\b": "burritos",
+        r"\bwrap[s]?\b": "wraps",
+        r"\bsandwich(?:es)?\b": "sandwiches",
+        r"\bburger[s]?\b": "burgers",
+        r"\bpizza\b": "pizza",
+        r"\bpasta\b": "pasta",
+        r"\bskillet\b": "skillet",
+        r"\bsoup[s]?\b": "soups",
+        r"\bstew[s]?\b": "stews",
+        r"\bsalad[s]?\b": "salads",
+    }
 }
 
 
@@ -182,6 +197,14 @@ def initialize_intent(raw_query: str) -> Dict[str, Any]:
 
 
 def extract_time_constraints(intent: Dict[str, Any], raw_query: str) -> None:
+    """
+    Try to match common time-related phrases in the query to extract max_minutes and target_minutes constraints.
+    - "under 30 minutes", "less than 30 mins", "max 30 min" -> max_minutes = 30
+    - "around 30 minutes", "about 30 mins", "approx 30 minutes" -> target_minutes = 30
+    
+    Provides hard and soft filters for retreival and ranking based on time preferences.
+    """
+    
     under_match = re.search(
         r"(?:under|less than|max)\s*(\d+)\s*(?:min|minute)s?",
         raw_query,
@@ -207,12 +230,25 @@ def extract_time_constraints(intent: Dict[str, Any], raw_query: str) -> None:
 
 
 def extract_proteins(intent: Dict[str, Any], raw_query: str) -> None:
+    """
+    Use the PROTEIN_KEYWORDS list to identify any mentioned proteins in the query and add them to the intent.
+    Allows the application of a soft boost to recipes containing these proteins, but alternative proteins are allowed in the results.
+    Dietary tags (e.g. "vegan", "vegetarian") are handled separately in the TAG_MAPPINGS and applied as hard filters, 
+    so protein preferences can be captured even if the user doesn't explicitly use a dietary tag.
+    """
+    
     for protein in PROTEIN_KEYWORDS:
         if re.search(rf"\b{re.escape(protein)}\b", raw_query, re.IGNORECASE):
             intent[IntentKey.PROTEINS.value].append(protein)
 
 
 def extract_tag_intent(intent: Dict[str, Any], raw_query: str) -> None:
+    """
+    Extract tag-based intent from the query using the TAG_MAPPINGS. For each category, check if any of the defined patterns match the query.
+    If a pattern matches, add the corresponding standardized tag to the intent for that category and remove the matched phrase from the clean_text to avoid redundancy in the lexical query. 
+    This allows the structured tags in the dataset to provide more precise filtering and boosting, while still retaining any unmatched phrases in the lexical query for broader matching.
+    """
+    
     clean_text = intent[IntentKey.CLEAN_TEXT.value]
 
     for category, mapping in TAG_MAPPINGS.items():
@@ -240,6 +276,13 @@ def parse_user_intent(raw_query: str) -> Dict[str, Any]:
 
 
 def build_base_bool_query(intent: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build the base boolean query for Elasticsearch based on the parsed intent. This includes:
+    - A multi_match query on the name, ingredients, and description fields using the cleaned lexical query
+    - Empty filter and should clauses to be populated based on hard constraints and soft preferences
+    """
+    
+    
     lexical_query = intent[IntentKey.LEXICAL_QUERY.value] or "recipe"
 
     return {
@@ -264,6 +307,11 @@ def build_base_bool_query(intent: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def apply_hard_filters(base_query: Dict[str, Any], intent: Dict[str, Any]) -> None:
+    """Apply hard filters to the base query based on the intent. This includes:
+    - Max minutes constraint (if specified)
+    - Dietary tags (if specified)
+    """
+
     max_minutes = intent[IntentKey.MAX_MINUTES.value]
     if max_minutes is not None:
         base_query["bool"]["filter"].append(
@@ -283,6 +331,13 @@ def apply_hard_filters(base_query: Dict[str, Any], intent: Dict[str, Any]) -> No
 
 
 def apply_soft_boosts(base_query: Dict[str, Any], intent: Dict[str, Any]) -> None:
+    """
+    Apply soft boosts to the base query based on the intent. This includes:
+    - Protein matches
+    - Soft tags 
+    - Taste preferences (spicy, sweet, etc.)
+    """
+    
     for protein in intent[IntentKey.PROTEINS.value]:
         base_query["bool"]["should"].append(
             {
@@ -332,6 +387,11 @@ def apply_time_proximity_scoring(
     base_query: Dict[str, Any],
     intent: Dict[str, Any],
 ) -> Dict[str, Any]:
+    """
+    If the user has a target_minutes preference, apply a Gaussian decay function to boost recipes with a minutes value close to the target. 
+    This provides a soft boost to recipes that are around the desired cooking time, while still allowing for some flexibility in the results.
+    """
+    
     target_minutes = intent[IntentKey.TARGET_MINUTES.value]
     if target_minutes is None:
         return base_query
@@ -372,14 +432,10 @@ def retrieve_candidates(
     top_k: int = RetrievalConfig.DEFAULT_TOP_K.value,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Stage 1 retrieval:
-    - parse query intent
-    - build lexical/filter query
-    - retrieve candidate recipes from Elasticsearch
-
-    Returns:
-        candidates: ES hits
-        intent: parsed intent dictionary
+    Main function to retrieve candidate recipes based on a raw user query. This function:
+        1) Parses the user intent from the raw query
+        2) Builds the Elasticsearch query based on the parsed intent
+        3) Executes the search query against the Elasticsearch index and returns the raw search hits along with the parsed intent for reference.
     """
     intent = parse_user_intent(raw_query)
     final_query = build_candidate_query(intent)

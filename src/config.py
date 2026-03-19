@@ -10,6 +10,9 @@ import json
 
 logger = logging.getLogger(__name__)
 
+"""
+Configuration module for loading and validating environment variables, setting up directory paths, and initializing the Elasticsearch client.
+"""
 
 # Helper functions for path resolution
 def repo_root() -> Path:

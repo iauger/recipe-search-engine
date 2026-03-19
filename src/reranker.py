@@ -7,39 +7,19 @@ from typing import Any, Dict, List
 
 import torch
 import torch.nn.functional as F
-import numpy as np
 
 from src.config import load_settings
 from src.models import RecipeNet, HeadType, AblationType
 from src.query_encoding import QueryFeatureProjector
-from src.search import parse_user_intent, retrieve_candidates
-
-
-# ---------------------------------------------------------------------------
-# Constants: derived from RecipeDataset (Phase 2) and confirmed by the saved
-# model weights shape (two_tower_meta_encoder.0.linear.weight: [64, 210]).
-#
-# column_mapping.json has 248 entries, but 4 are text columns (indices 0-3:
-# ingredients_clean, steps_clean, tags_clean, description_clean) that
-# RecipeDataset never includes in its numeric tensors.  The remaining 244
-# columns split as:
-#
-#   meta_in  (210): 10 numeric + 200 OHE (cat_* / ing_*)
-#   tag_in    (34): 17 pred_* + 17 intensity_*
-#
-# Within meta_in:
-#   num_meta  (10): minutes, n_steps, n_ingredients, calories, fat, sugar,
-#                   sodium, protein, saturated_fat, carbs
-#   cat_meta (200): cat_* (100) + ing_* (100)
-# ---------------------------------------------------------------------------
+from src.search import retrieve_candidates
 
 _TEXT_COL_INDICES = {0, 1, 2, 3}   # columns skipped when building input tensors
 
-META_DIM   = 210  # confirmed by saved weights: two_tower_meta_encoder shape [64, 210]
-TAG_DIM    =  34  # 17 pred_* + 17 intensity_*
+META_DIM   = 210  # meta features (numeric + OHE categorical) fed to the meta encoder
+TAG_DIM    =  34  # review tag features including pred_* and intensity_* fed to the tag encoder
 NUM_META   =  10  # continuous numeric features
-CAT_META   = 200  # OHE categorical features (cat_* + ing_*)
-HIDDEN_DIM = 128  # must match hidden_dim used during Phase 2 training
+CAT_META   = 200  # categorical features (cat_* + ing_*)
+HIDDEN_DIM = 128  # dim of the shared latent space where query and recipe embeddings live
 
 
 @dataclass
@@ -57,19 +37,16 @@ class RerankedResult:
 class SemanticReranker:
     """
     Two-stage reranker that combines:
+    1. Elasticsearch base score 
+    2. Rule-based alignment score using structured intent extracted from the query
+    3. Embedding cosine similarity between the query and recipe in the 128-D latent space learned by RecipeNet
+    4. Quality score             
 
-    1. Elasticsearch base score     – lexical relevance from Stage 1 retrieval
-    2. Rule-based alignment score   – deterministic structured intent matching
-    3. Embedding cosine similarity  – query projected into the RecipeNet latent
-                                      space and compared against stored recipe
-                                      embeddings from the Phase 2 bundle
-    4. Quality score                – scalar rating prediction from RecipeNet
-
-    The embedding similarity is the key addition over the prior rule-based
-    reranker: rather than relying solely on keyword matching, the query is
-    encoded into the same 128-D manifold learned during Phase 2 training,
-    allowing the geometry of that space to surface semantically related recipes
-    that may not share exact tag or ingredient tokens with the query.
+    The system first extracts structured intent from the raw query using QueryFeatureProjector, 
+    then encodes the query into the latent space using a frozen RecipeNet.  
+    Each candidate recipe is scored on the three dimensions (alignment, semantic similarity, quality) 
+    and combined with the original ES score using a stratified weighting scheme based on the richness of the extracted intent.  
+    The final output is a list of RerankedResult objects sorted by the combined final score.
     """
 
     def __init__(self, s: Any):
@@ -88,26 +65,19 @@ class SemanticReranker:
         self.id_to_index = {str(r_id): idx for idx, r_id in enumerate(self.recipe_ids)}
 
         # Build the feature-index lookup used when constructing query tensors.
-        # Mirrors the column_mapping.json layout but skips the 4 text columns
-        # that are never part of the numeric model input.
         self.col_map: Dict[str, int] = s.column_mapping
         self._meta_cols, self._tag_cols = self._split_feature_columns()
 
         # Load the frozen RecipeNet for query encoding
         self.model = self._load_model(s.model_weights_path)
 
-    # ------------------------------------------------------------------
-    # Initialisation helpers
-    # ------------------------------------------------------------------
-
     def _load_bundle(self, path: str) -> Dict[str, Any]:
         return torch.load(path, map_location=torch.device("cpu"), weights_only=False)
 
     def _load_model(self, weights_path: str) -> RecipeNet:
         """
-        Reconstruct the RecipeNet (Residual V2) architecture and load the
-        saved Phase 2 weights.  The model is frozen and set to eval mode –
-        it is used solely as a feature encoder for query projection.
+        Reconstruct the RecipeNet (Residual V2) architecture and load the saved Phase 2 weights.  
+        The model is frozen and used solely as a feature encoder for query projection.
         """
         model = RecipeNet(
             meta_in=META_DIM,
@@ -119,10 +89,9 @@ class SemanticReranker:
         ).to(self.device)
 
         state_dict = torch.load(weights_path, map_location=self.device, weights_only=True)
-
-        # The weights were saved when the meta encoder attribute was named
-        # `legacy_meta_encoder`. It was later renamed to `default_meta_encoder`
-        # in models.py. Remap the keys so load_state_dict doesn't reject them.
+        
+        # Fix a naming inconsistency in the saved state dict keys.
+        # Will remove this remapping in future versions when Phase 2 training uses the updated "default_meta_encoder" naming convention.
         remapped_state_dict = {
             k.replace('legacy_meta_encoder', 'default_meta_encoder'): v
             for k, v in state_dict.items()
@@ -140,16 +109,6 @@ class SemanticReranker:
         """
         Partition column_mapping into meta and tag index lists, preserving
         the positional order expected by RecipeNet's dual-encoder inputs.
-
-        Text columns (indices 0-3) are skipped – they have no numeric
-        representation in the model input tensors.
-
-        Returns
-        -------
-        meta_cols : list[(col_name, tensor_position)]
-            214 meta features in ascending tensor-position order.
-        tag_cols  : list[(col_name, tensor_position)]
-            34 tag features in ascending tensor-position order.
         """
         meta_entries = []
         tag_entries  = []
@@ -173,9 +132,7 @@ class SemanticReranker:
 
         return meta_cols, tag_cols
 
-    # ------------------------------------------------------------------
     # Query encoding
-    # ------------------------------------------------------------------
 
     def _build_query_tensors(
         self,
@@ -184,17 +141,6 @@ class SemanticReranker:
         """
         Convert a ProjectedQuery into (meta_tensor, tag_tensor) matching the
         exact shape expected by RecipeNet's dual encoders.
-
-        The ProjectedQuery already carries meta_vector and tag_vector aligned
-        to the column_mapping schema via QueryFeatureProjector.  We simply
-        re-map those sparse activation vectors into the contiguous sub-tensors,
-        skipping the 4 text-column slots.
-
-        Numeric continuous features (minutes, calories, etc.) remain zero
-        because they cannot be derived from free text.  This is an accepted
-        limitation: the query will land near the origin of the numeric subspace
-        but the categorical / tag activations still guide it toward the correct
-        neighbourhood of the manifold.
         """
         meta_tensor = torch.zeros(1, META_DIM, dtype=torch.float32)
         tag_tensor  = torch.zeros(1, TAG_DIM,  dtype=torch.float32)
@@ -205,7 +151,6 @@ class SemanticReranker:
             if raw_idx is None:
                 continue
             # Shift raw_idx to account for the 4 skipped text columns
-            # The projector's meta_vector excludes text cols, so use tensor_pos
             val = projected_query.meta_vector[tensor_pos] if tensor_pos < len(projected_query.meta_vector) else 0.0
             meta_tensor[0, tensor_pos] = float(val)
 
@@ -221,15 +166,6 @@ class SemanticReranker:
     def encode_query(self, projected_query: Any) -> torch.Tensor:
         """
         Project a structured query into the 128-D RecipeNet latent space.
-
-        Passes the sparse query feature vectors through the frozen RecipeNet
-        encoder and returns a unit-normalised 128-D embedding that can be
-        directly compared to stored recipe embeddings via dot product.
-
-        Returns
-        -------
-        query_embedding : torch.Tensor, shape (128,)
-            Unit-normalised query embedding on CPU.
         """
         meta_tensor, tag_tensor = self._build_query_tensors(projected_query)
 
@@ -245,9 +181,7 @@ class SemanticReranker:
         query_embedding = F.normalize(embedding.cpu().float(), p=2, dim=1).squeeze(0)  # (128,)
         return query_embedding
 
-    # ------------------------------------------------------------------
     # Scoring components
-    # ------------------------------------------------------------------
 
     def compute_semantic_similarity(
         self,
@@ -255,14 +189,7 @@ class SemanticReranker:
         recipe_id: str,
     ) -> float:
         """
-        Cosine similarity between the query embedding and the stored recipe
-        embedding from the Phase 2 bundle.
-
-        Both vectors are pre-normalised, so this reduces to a dot product.
-        Returns 0.0 if the recipe_id is not found in the bundle.
-
-        Returns a value in [-1, 1]; in practice nearly always in [0, 1]
-        because ReLU activations keep embeddings non-negative.
+        Cosine similarity between the query embedding and the stored recipe embedding from the Phase 2 bundle.
         """
         idx = self.id_to_index.get(str(recipe_id))
         if idx is None:
@@ -273,7 +200,7 @@ class SemanticReranker:
         return float(sim)
 
     def get_quality_score(self, recipe_id: str) -> float:
-        """Scalar rating prediction from the Phase 2 bundle (range ~1–5)."""
+        """Scalar rating prediction from the Phase 2 bundle (range ~1-5)."""
         idx = self.id_to_index.get(str(recipe_id))
         if idx is None:
             return 0.0
@@ -290,11 +217,6 @@ class SemanticReranker:
     ) -> float:
         """
         Rule-based structured intent alignment score.
-
-        Rewards candidates that match the structured intent extracted from the
-        query (cuisine, method, course, dietary tags, proteins, timing) against
-        the recipe's indexed fields.  Provides a reliable signal for exact
-        constraint satisfaction that pure embedding similarity cannot guarantee.
         """
         score = 0.0
 
@@ -309,8 +231,9 @@ class SemanticReranker:
         name_text = str(candidate_source.get("name", "")).lower()
         minutes = candidate_source.get("minutes")
 
-        # High-value structured matches: cuisine, method, course, occasion,
-        # dish type, and dietary constraints
+        # High-value structured matches: cuisine, method, course, occasion, dish type, and dietary constraints
+        # Admittedly my own bias is informing what is a high-value signal here. 
+        # Future versions could learn these weights from user interaction data rather than relying on manual intuition. 
         high_value_groups = [
             projected_query.cuisines,
             projected_query.methods,
@@ -327,7 +250,7 @@ class SemanticReranker:
                 elif value_norm in name_text:
                     score += 0.75
 
-        # Taste signal (softer – taste words are noisy in tags)
+        # Taste signal
         for value in projected_query.taste:
             value_norm = str(value).strip().lower()
             if value_norm in tags_norm:
@@ -386,33 +309,12 @@ class SemanticReranker:
     @staticmethod
     def get_weight_profile(projected_query: Any) -> Dict[str, Any]:
         """
-        Stratified weight profiles based on structured intent richness.
-
-        Intent richness is measured by counting the number of high-signal
-        structured intent groups that fired during query parsing.  Taste and
-        dish_type are intentionally excluded — they are softer signals that
-        don't strongly constrain the result space and would inflate the count
-        for queries that are still essentially exploratory.
-
-        Three tiers:
-
-        HIGH intent (3+ signals)
-            Alignment dominates.  The parser has captured explicit constraints
-            (cuisine, protein, dietary restriction, etc.) and rule-based
-            matching is the most reliable signal.  Semantic similarity is
-            compressed in this regime — all retrieved candidates look similar
-            in the embedding space — so its weight is minimised.
-
-        MEDIUM intent (1–2 signals)
-            Balanced weighting.  Alignment provides partial structure; the
-            embedding catches semantic outliers the rules miss (e.g. a recipe
-            that is thematically right but lacks the exact tag token).
-
-        LOW intent (0 signals)
-            Semantic similarity carries the load.  Alignment fires weakly and
-            uniformly across all candidates, so it is down-weighted to avoid
-            rewarding noise.  Quality gets a larger boost because "give me
-            something good" is a reasonable fallback for vague queries.
+        Stratified weight profiles based on structured intent richness. 
+        - High intent: 3+ high-signal tags
+        - Medium intent: 1-2 high-signal tags
+        - Low intent: 0 high-signal tags
+        
+        Used to dynamically adjust the weighting of the scoring signals in combine_scores() based on how much explicit intent is extracted from the query.
         """
         intent_signals = (
             len(projected_query.dietary_tags)
@@ -423,6 +325,8 @@ class SemanticReranker:
             + len(projected_query.proteins)
         )
 
+        # The weight values here are manually tuned based on intuition and experimentation.
+        # Future iterations could learn optimal weight profiles from user interaction data rather than relying on fixed heuristics.
         if intent_signals >= 3:
             return {"tier": "high",   "lex": 1.0, "alignment": 1.5, "semantic": 0.1,  "quality": 0.25}
         elif intent_signals >= 1:
@@ -439,12 +343,7 @@ class SemanticReranker:
         weights: Dict[str, float],
     ) -> float:
         """
-        Weighted combination of the four scoring signals using the
-        stratified weight profile selected by get_weight_profile().
-
-        semantic_sim arrives in [-1, 1]; clamped to [0, 1] to avoid
-        penalising recipes that land in the opposite embedding hemisphere —
-        an artifact of sparse query projection rather than true negative signal.
+        Weighted combination of the four scoring signals using the stratified weight profile selected by get_weight_profile().
         """
         semantic_sim_clamped = max(0.0, semantic_sim)
 
@@ -455,9 +354,7 @@ class SemanticReranker:
             + quality_score        * weights["quality"]
         )
 
-    # ------------------------------------------------------------------
     # Main entry point
-    # ------------------------------------------------------------------
 
     def rerank(
         self,
@@ -467,37 +364,10 @@ class SemanticReranker:
     ) -> List[RerankedResult]:
         """
         Rerank a list of Stage 1 Elasticsearch candidates.
- 
-        Pipeline per candidate:
-          1. score_alignment   – rule-based structured intent check
-          2. encode_query      – project query into 128-D latent space (once)
-          3. compute_semantic_similarity – cosine sim vs stored embedding
-          4. get_quality_score – scalar predicted rating
-          5. combine_scores    – weighted sum → final_score
-          6. sort descending by final_score
- 
-        Parameters
-        ----------
-        projected_query : ProjectedQuery
-            Output of QueryFeatureProjector.project().
-        candidates : list of ES hit dicts
-            Raw hits from retrieve_candidates().
-        mode_weights : dict | None
-            When provided by the engine (e.g. for LEXICAL, SEMANTIC, QUALITY
-            modes), bypasses get_weight_profile() entirely and uses the
-            supplied fixed weights instead.  When None, stratified weights
-            are resolved from the query's intent richness as normal — this
-            is the default behaviour for HYBRID and ABLATION_NO_SEM.
- 
-        Returns
-        -------
-        List[RerankedResult] sorted by final_score descending.
         """
-        # Use caller-supplied fixed weights (engine modes) or resolve
-        # stratified weights from query intent richness (hybrid/ablation).
+        # Use caller-supplied fixed weights (engine modes) or resolve stratified weights from query intent richness (hybrid/ablation).
         weights = mode_weights if mode_weights is not None else self.get_weight_profile(projected_query)
  
-        # Encode the query once – shared across all candidates
         query_embedding = self.encode_query(projected_query)
  
         reranked: List[RerankedResult] = []
@@ -534,11 +404,7 @@ class SemanticReranker:
         reranked.sort(key=lambda x: x.final_score, reverse=True)
         return reranked
 
-
-# ------------------------------------------------------------------
-# Quick smoke-test
-# ------------------------------------------------------------------
-
+# Testing and demonstration with test queries
 if __name__ == "__main__":
     s = load_settings()
 
@@ -564,7 +430,7 @@ if __name__ == "__main__":
               f"sem={weights['semantic']}  quality={weights['quality']})")
         print(f"{'='*65}")
 
-        print("  Stage 1 – Elasticsearch baseline:")
+        print("  Stage 1 - Elasticsearch baseline:")
         for i, hit in enumerate(candidates, start=1):
             source = hit["_source"]
             name   = source.get("name", "").title()
@@ -572,7 +438,7 @@ if __name__ == "__main__":
             score  = hit.get("_score", 0.0)
             print(f"    {i}. [{score:.2f}] {name} ({mins}m)")
 
-        print("  Stage 2 – Reranked:")
+        print("  Stage 2 - Reranked:")
         for i, r in enumerate(results, start=1):
             name = r.source.get("name", "").title()
             mins = r.source.get("minutes")

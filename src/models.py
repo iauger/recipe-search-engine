@@ -3,6 +3,11 @@ import torch.nn as nn
 from enum import Enum
 from src.layers import FullyConnectedBlock, ResidualBlock, ResidualLinearBlock, PLQPLayer
 
+"""
+Same as layers.py, this module is copied from the embedding phase of the project and contains some layers that are not used in this phase.
+I'm leaving them alone for now, but in a future refactor to combine all phases into a single codebase, I would consider removing unused layers and consolidating the code to avoid duplication across phases.
+"""
+
 
 class HeadType(Enum):
     SHALLOW = "shallow"

@@ -18,7 +18,7 @@ def create_index(s):
     
     print("Testing connection to Elasticsearch...")
     try:
-        # 1. Do a GET request to verify the client can actually talk to the server
+        # GET request to verify the client can actually talk to the server
         info = s.es_client.info()
         print(f"Successfully connected to Elasticsearch v{info['version']['number']}")
     except Exception as e:
@@ -26,12 +26,11 @@ def create_index(s):
         print("Check if a VPN or proxy is blocking the connection.")
         return
 
-    # 2. We bypass the 'exists' check (which uses a HEAD request) to avoid Windows firewalls.
     # ignore_unavailable=True safely deletes the index if it exists, and ignores if it doesn't.
     print(f"Resetting index: {s.index_name}")
     s.es_client.indices.delete(index=s.index_name, ignore_unavailable=True)
 
-    # 3. The blueprint for the search engine
+    # The blueprint for the search engine
     properties = {
         "name": {"type": "text", "analyzer": "english"},
         "description_clean": {"type": "text", "analyzer": "english"},
@@ -52,7 +51,7 @@ def create_index(s):
         properties[f"pred_{tag}"] = {"type": "boolean"}
         properties[f"intensity_{tag}"] = {"type": "float"}
 
-    # 4. In Elasticsearch v8, we pass 'mappings' directly instead of a 'body' dictionary
+    # Pass 'mappings' directly instead of a 'body' dictionary
     s.es_client.indices.create(index=s.index_name, mappings={"properties": properties})
     print(f"Created index '{s.index_name}' with hybrid search mappings.")
 
@@ -70,6 +69,7 @@ def generate_documents(df, bundle, s):
             "_source": doc
         }
 
+# Main orchestration function to run the ingestion process
 def run_ingestion(s):
     print("Loading search data into memory.")
     df = pd.read_parquet(s.processed_recipes_path)
