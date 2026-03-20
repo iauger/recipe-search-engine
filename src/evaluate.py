@@ -1,46 +1,5 @@
 # src/evaluate.py
 
-"""
-Five-mode ablation evaluation for the recipe IR system.
-
-Evaluates all five SearchModes across a stratified query set spanning
-high, medium, and low intent tiers.  The primary output is a comparison
-table of mean relevance score@5 per mode, broken down by intent tier,
-which directly supports the stratification argument in the project report.
-
-Evaluation Design
------------------
-Queries are grouped into three intent tiers that mirror the stratified
-weight profiles in the reranker:
-
-  HIGH   -- rich structured intent (cuisine, protein, dietary, method)
-            Rule-based alignment should dominate; embedding adds little.
-  MEDIUM -- partial structured intent (1-2 signals)
-            Balanced regime; embedding catches outliers rules miss.
-  LOW    -- exploratory / vibe queries (0 structured signals)
-            Alignment fires uniformly; embedding carries the load.
-
-Relevance Scoring
------------------
-score_result() is a rule-based proxy scorer that rewards:
-  1. Hard constraint satisfaction (time limits, dietary tags) -- zero if violated
-  2. Structured intent matches (cuisine, method, course, protein)
-  3. Leftover lexical token matches in name / ingredients
-
-This scorer is deliberately independent of the reranker's own alignment
-logic to avoid circular self-evaluation.  It cannot validate the embedding
-signal directly -- that limitation is acknowledged in the report.
-
-Known Limitations
------------------
-- No human relevance judgments; scores are heuristic proxies.
-- The scorer shares vocabulary with the alignment signal, so high-intent
-  queries will show inflated scores for all modes that surface on-topic
-  results -- the delta between modes is more meaningful than absolute values.
-- Quality and Semantic modes are evaluated against the same intent-derived
-  scorer, which inherently disadvantages them on high-intent queries.
-"""
-
 import sys
 import io
 import copy
@@ -97,8 +56,7 @@ def score_result(result: Any, intent: Dict[str, Any]) -> float:
     """
     Rule-based relevance proxy scorer.
 
-    Works on both raw ES hit dicts and RerankedResult objects, so it can
-    score all five modes from a uniform interface.
+    Works on both raw ES hit dicts and RerankedResult objects, so it can score all five modes from a uniform interface.
 
     Score components
     ----------------
@@ -134,7 +92,7 @@ def score_result(result: Any, intent: Dict[str, Any]) -> float:
         if str(diet).strip().lower() not in tags_norm:
             return 0.0
 
-    # -- Structured match bonuses -----------------------------------------
+    # structured intent matches
     for group in ["cuisines", "methods", "occasions", "courses"]:
         for value in intent.get(group, []):
             if str(value).strip().lower() in tags_norm:
@@ -158,7 +116,7 @@ def score_result(result: Any, intent: Dict[str, Any]) -> float:
         except (TypeError, ValueError):
             pass
 
-    # -- Leftover lexical tokens ------------------------------------------
+    # leftover lexical tokens
     clean_text = str(intent.get("clean_text", "")).lower()
     structured_tokens = set(
         [str(x).strip().lower() for x in intent.get("proteins", [])]
@@ -209,11 +167,6 @@ def precision_at_1(results: list, intent: Dict[str, Any]) -> float:
         return 0.0
     return 1.0 if score_result(results[0], intent) > 0.0 else 0.0
 
-
-# ---------------------------------------------------------------------------
-# Per-query evaluation
-# ---------------------------------------------------------------------------
-
 def evaluate_query(
     query: str,
     engine: SearchEngine,
@@ -247,11 +200,7 @@ def evaluate_query(
         "all_mode_results": all_mode_results,
     }
 
-
-# ---------------------------------------------------------------------------
-# Full evaluation run
-# ---------------------------------------------------------------------------
-
+# full evaluation across all queries and modes, with summary statistics and tables printed to console
 def evaluate_engine(top_k: int = 5) -> Dict[str, Any]:
     """
     Run the full ablation evaluation across all queries and modes.
@@ -267,7 +216,6 @@ def evaluate_engine(top_k: int = 5) -> Dict[str, Any]:
         report = evaluate_query(query, engine, top_k=top_k)
         query_reports.append(report)
 
-    # -- Overall means per mode -------------------------------------------
     overall_means: Dict[str, float] = {
         mode.value: float(np.mean([r["mode_means"][mode.value] for r in query_reports]))
         for mode in SearchMode
@@ -277,7 +225,6 @@ def evaluate_engine(top_k: int = 5) -> Dict[str, Any]:
         for mode in SearchMode
     }
 
-    # -- Per-tier means per mode ------------------------------------------
     tier_means: Dict[str, Dict[str, float]] = {}
     tier_p1:    Dict[str, Dict[str, float]] = {}
 
@@ -292,7 +239,7 @@ def evaluate_engine(top_k: int = 5) -> Dict[str, Any]:
             for mode in SearchMode
         }
 
-    # -- Delta: HYBRID vs each other mode ---------------------------------
+    # compute deltas vs HYBRID for overall means
     hybrid_overall = overall_means[SearchMode.HYBRID.value]
     deltas_vs_hybrid: Dict[str, float] = {
         mode.value: hybrid_overall - overall_means[mode.value]
@@ -309,11 +256,6 @@ def evaluate_engine(top_k: int = 5) -> Dict[str, Any]:
         "deltas_vs_hybrid": deltas_vs_hybrid,
         "top_k": top_k,
     }
-
-
-# ---------------------------------------------------------------------------
-# Display helpers
-# ---------------------------------------------------------------------------
 
 def print_summary(summary: Dict[str, Any]) -> None:
     """Print the full evaluation summary as five clean numbered tables."""
@@ -343,7 +285,7 @@ def print_summary(summary: Dict[str, Any]) -> None:
             row += "".join(f"{report[key][m]:>{col_w}.3f}" for m in modes)
             print(row)
 
-    # -- Table 1: NDCG@k --------------------------------------------------
+    # Table 1: NDCG@k
     print(f"\n{sep}")
     print(f"TABLE 1: NDCG@{top_k} PER QUERY")
     print(sep)
@@ -351,7 +293,7 @@ def print_summary(summary: Dict[str, Any]) -> None:
     print(dash)
     _query_rows("mode_means")
 
-    # -- Table 2: P@1 -----------------------------------------------------
+    # Table 2: P@1
     print(f"\n{sep}")
     print(f"TABLE 2: PRECISION@1 PER QUERY")
     print(sep)
@@ -359,7 +301,7 @@ def print_summary(summary: Dict[str, Any]) -> None:
     print(dash)
     _query_rows("mode_p1")
 
-    # -- Table 3: Tier summary --------------------------------------------
+    # Table 3: Tier summary 
     print(f"\n{sep}")
     print(f"TABLE 3: TIER SUMMARY  (mean NDCG@{top_k} / mean P@1)")
     print(sep)
@@ -375,7 +317,7 @@ def print_summary(summary: Dict[str, Any]) -> None:
         print(p1_row)
         print()
 
-    # -- Table 4: Overall -------------------------------------------------
+    # Table 4: Overall
     print(f"\n{sep}")
     print(f"TABLE 4: OVERALL SUMMARY  (mean across all {len(ALL_QUERIES)} queries)")
     print(sep)
@@ -389,7 +331,7 @@ def print_summary(summary: Dict[str, Any]) -> None:
     print(ndcg_row)
     print(p1_row)
 
-    # -- Table 5: Deltas vs HYBRID ----------------------------------------
+    # Table 5: Deltas vs HYBRID
     print(f"\n{sep}")
     print("TABLE 5: HYBRID IMPROVEMENT  (HYBRID - other, positive = HYBRID wins)")
     print(sep)
@@ -403,7 +345,6 @@ def print_summary(summary: Dict[str, Any]) -> None:
         pd = "+" if p1_delta   >= 0 else ""
         print(f"  HYBRID vs {mode:<22} {nd}{ndcg_delta:>12.3f}  {pd}{p1_delta:>10.3f}")
 
-    # -- Key finding ------------------------------------------------------
     print(f"\n{sep}")
     print("KEY FINDING: HYBRID vs ABLATION_NO_SEM delta by tier")
     print("(isolates the marginal contribution of the embedding layer)")
@@ -458,11 +399,6 @@ def print_query_detail(report: Dict[str, Any], top_k: int = 5) -> None:
                 f"  sim={r.semantic_sim:.3f}"
                 f"  quality={r.quality_score:.2f}"
             )
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     summary = evaluate_engine(top_k=5)
