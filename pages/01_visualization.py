@@ -1,14 +1,4 @@
 # pages/01_visualization.py
-# Streamlit multipage — accessible from the sidebar navigation.
-#
-# Shows the full recipe embedding manifold with:
-#   - All corpus recipes as a gray density scatter (subsampled for performance)
-#   - Top-k search results highlighted and colored by rank
-#   - Query embedding projected into the manifold via the saved UMAP reducer
-#
-# Requires generate_umap.py to have been run first to produce:
-#   data/processed/final_residual_v2_umap_reducer.pkl
-#   data/processed/final_residual_v2_umap_meta.npz
 
 import sys
 import io
@@ -50,10 +40,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-
-# ---------------------------------------------------------------------------
 # Cached loaders
-# ---------------------------------------------------------------------------
 
 @st.cache_resource(show_spinner="Loading search engine...")
 def get_engine():
