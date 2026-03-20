@@ -1,0 +1,38 @@
+# ---------------------------------------------------------------
+# INFO 624 — Recipe Information Retrieval System
+# Requirements
+# ---------------------------------------------------------------
+
+# Core data & ML
+numpy
+pandas
+torch
+scikit-learn
+
+# Elasticsearch
+elasticsearch==8.12.0
+
+# Neural network (Phase 2 architecture — RecipeNet)
+# torch already listed above
+
+# Embedding & dimensionality reduction
+umap-learn
+
+# Environment & configuration
+python-dotenv
+
+# Notebook
+jupyter
+ipython
+
+# Visualization (notebook helpers)
+matplotlib
+seaborn
+
+# Streamlit UI (optional — not required for core system or CLI)
+streamlit
+plotly
+
+# Utilities
+tqdm
+pyarrow        # parquet file support for pandas

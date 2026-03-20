@@ -1,7 +1,6 @@
 # Recipe Information Retrieval System
 **Author:** Ian Auger  
 **Course:** INFO 624 — Information Retrieval  
-**Institution:** Drexel University
 
 ---
 
@@ -73,7 +72,7 @@ The following files are required and are **not included in this repository** due
 
 | File | Source | Description |
 |---|---|---|
-| `PROCESSED_search_recipes.parquet` | Phase 3 preprocessing | Recipe documents for ES indexing |
+| `PROCESSED_search_recipes.parquet` | Phase 2 preprocessing | Recipe documents for ES indexing, but processed as part of Phase 2 `preprocessing.py` |
 | `final_residual_v2_embeddings.pt` | Phase 2 inference | RecipeNet embedding bundle |
 | `best_model_residual_v2_all_features_mse.pth` | Phase 2 training | RecipeNet model weights |
 | `column_mapping.json` | Phase 2 preprocessing | Feature schema for query projection |
@@ -100,10 +99,10 @@ This launches an interactive menu:
 
 **Recommended first run sequence:**
 ```
-Option 1 → index the corpus (~5 minutes)
-Option 2 → run a search query
-Option 3 → inspect intent parsing
-Option 4 → run the full evaluation (~60 seconds)
+Option 1: index the corpus (takes 1-3 minutes)
+Option 2: run a search query
+Option 3: inspect intent parsing
+Option 4: run the full evaluation (pre-seeded with 10 example queries across each intent tier)
 ```
 
 ---
@@ -126,7 +125,8 @@ The system supports five search modes selectable at query time:
 
 ```
 ├── main.py                     # CLI entrypoint
-├── docker-compose.yml          # Elasticsearch container
+├── docker
+│   └── docker-compose.yml      # Elasticsearch container
 ├── requirements.txt
 ├── notebooks/
 │   └── project_report.ipynb    # Project report and evaluation
@@ -163,11 +163,6 @@ Key findings are documented in `notebooks/project_report.ipynb` Section 5.
 ## Notebook
 
 The project report notebook walks through all major deliverables:
-
-```bash
-jupyter notebook notebooks/project_report.ipynb
-```
-
 Requires Elasticsearch to be running and the index to be populated for live code cells. Static outputs are preserved in the committed notebook.
 
 ---
